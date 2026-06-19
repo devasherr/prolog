@@ -8,10 +8,13 @@ import (
 
 	api "github.com/devasherr/prolog/api/v1"
 	"github.com/devasherr/prolog/config"
+	"github.com/devasherr/prolog/internal/auth"
 	"github.com/devasherr/prolog/internal/log"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 )
 
 func TestServer(t *testing.T) {
@@ -21,6 +24,7 @@ func TestServer(t *testing.T) {
 		"produce/consume a message to/from the log succeeds": testProduceConsume,
 		"produce/consume stream succeeds":                    testProduceConsumeStream,
 		"consume past log boundary fails":                    testConsumePastBoundary,
+		"unauthorized fails":                                 testUnauthorized,
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			rootClient, nobodyClient, config, teardown := setupTest(t, nil)
@@ -43,8 +47,8 @@ func setupTest(t *testing.T, fn func(*Config)) (api.LogClient, api.LogClient, *C
 	clientCreds := credentials.NewTLS(clientTLSConfig)
 	grpc.Dial(l.Addr().String(), grpc.WithTransportCredentials(clientCreds))
 
-	clientOptions := []grpc.DialOption{grpc.WithInsecure()}
-	cc, err := grpc.Dial(l.Addr().String(), clientOptions...)
+	// clientOptions := []grpc.DialOption{grpc.WithInsecure()}
+	// cc, err := grpc.Dial(l.Addr().String(), clientOptions...)
 	require.NoError(t, err)
 
 	serverTLSConfig, err := config.SetupTLSConfig(config.TLSConfig{
@@ -52,6 +56,7 @@ func setupTest(t *testing.T, fn func(*Config)) (api.LogClient, api.LogClient, *C
 		KeyFile:       config.ServerKeyFile,
 		CAFile:        config.CAFile,
 		ServerAddress: l.Addr().String(),
+		Server:        true,
 	})
 
 	newClient := func(crtPath, keyPath string) (
@@ -86,7 +91,8 @@ func setupTest(t *testing.T, fn func(*Config)) (api.LogClient, api.LogClient, *C
 	clog, err := log.NewLog(dir, log.Config{})
 	require.NoError(t, err)
 
-	cfg := &Config{CommitLog: clog}
+	authorizer := auth.New(config.ACLModelFile, config.ACLPolicyFile)
+	cfg := &Config{CommitLog: clog, Authorizer: authorizer}
 	if fn != nil {
 		fn(cfg)
 	}
@@ -100,7 +106,7 @@ func setupTest(t *testing.T, fn func(*Config)) (api.LogClient, api.LogClient, *C
 
 	return rootClient, nobodyClient, cfg, func() {
 		server.Stop()
-		cc.Close()
+		// cc.Close()
 		l.Close()
 		clog.Remove()
 	}
@@ -187,5 +193,27 @@ func testProduceConsumeStream(t *testing.T, client api.LogClient, _ api.LogClien
 				Offset: uint64(i),
 			})
 		}
+	}
+}
+
+func testUnauthorized(t *testing.T, _, client api.LogClient, config *Config) {
+	ctx := context.Background()
+	produce, err := client.Produce(ctx, &api.ProduceRequest{Record: &api.Record{Value: []byte("hello world")}})
+	if produce != nil {
+		t.Fatalf("produce response should be nil")
+	}
+
+	gotCode, wantCode := status.Code(err), codes.PermissionDenied
+	if gotCode != wantCode {
+		t.Fatalf("got code: %d, want: %d", gotCode, wantCode)
+	}
+
+	consume, err := client.Consume(ctx, &api.ConsumeRequest{Offset: 0})
+	if consume != nil {
+		t.Fatalf("consume response should be nil")
+	}
+	gotCode, wantCode = status.Code(err), codes.PermissionDenied
+	if gotCode != wantCode {
+		t.Fatalf("got code: %d, want: %d", gotCode, wantCode)
 	}
 }
